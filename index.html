@@ -1,0 +1,1130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Supply Network Game</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
+<script>
+/* ===================== ONLINE MODE (optional) =====================
+   Leave the "PASTE_..." values as they are  ->  LOCAL mode (this browser only).
+   Replace ALL of them with your Firebase values  ->  ONLINE mode (shared by everyone). */
+const firebaseConfig = {
+  apiKey: "AIzaSyBT3EumofcLtInfd-7NvX0QlsAD7_njIME",
+  authDomain: "logistics-gamev10.firebaseapp.com",
+  databaseURL: "https://logistics-gamev10-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "logistics-gamev10",
+  appId: "1:625451538156:web:d1982391cc677397f4b7c9"
+};
+const USE_FIREBASE = !firebaseConfig.apiKey.startsWith("PASTE");
+/* ================================================================== */
+</script>
+<script>
+/* ===================== INSTRUCTOR: EDIT THIS ===================== */
+const INSTRUCTOR_PASSWORD = "LOG101";
+
+// true  = PRACTICE (demo) version: standard shipping only (2-round lead time),
+//         no express shipping and NO stock-out penalty. Data is stored separately.
+// false = REAL game: express shipping available and stock-out penalty applies.
+const DEMO_MODE = true;
+/* ================================================================= */
+
+document.title = DEMO_MODE ? 'Supply Network Game - PRACTICE' : 'Supply Network Game';
+
+/* ---------------------------------------------------------------
+   LocalDB: a tiny stand-in for a realtime database.
+   Everything lives in this browser's localStorage under one key.
+   Supports: ref(path).once/on/off/set/update/transaction
+   Tabs/windows of the same browser stay in sync automatically.
+---------------------------------------------------------------- */
+const DB_KEY = 'supplygame_local_db_v1';
+const LocalDB = (function () {
+  const listeners = [];
+  const readTree = () => { try { return JSON.parse(localStorage.getItem(DB_KEY)) || {}; } catch (e) { return {}; } };
+  const writeTree = t => localStorage.setItem(DB_KEY, JSON.stringify(t));
+  const parts = p => (p || '').split('/').filter(Boolean);
+  const clone = v => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
+
+  function getPath(t, path) {
+    let o = t;
+    for (const k of parts(path)) {
+      if (o === null || typeof o !== 'object' || !(k in o)) return undefined;
+      o = o[k];
+    }
+    return o;
+  }
+  function setPath(t, path, v) {
+    const ps = parts(path);
+    if (!ps.length) return;
+    let o = t; const stack = [];
+    for (let i = 0; i < ps.length - 1; i++) {
+      const k = ps[i];
+      if (typeof o[k] !== 'object' || o[k] === null) {
+        if (v === null || v === undefined) return;
+        o[k] = {};
+      }
+      stack.push([o, k]); o = o[k];
+    }
+    const last = ps[ps.length - 1];
+    if (v === null || v === undefined) delete o[last]; else o[last] = clone(v);
+    for (let i = stack.length - 1; i >= 0; i--) {           // prune empty parents
+      const [p, k] = stack[i];
+      if (p[k] && typeof p[k] === 'object' && Object.keys(p[k]).length === 0) delete p[k]; else break;
+    }
+  }
+  const snap = v => ({
+    val: () => (v === undefined ? null : clone(v)),
+    exists: () => v !== undefined && v !== null,
+  });
+  function notify() {
+    const t = readTree();
+    listeners.slice().forEach(l => {
+      const v = getPath(t, l.path);
+      const s = JSON.stringify(v === undefined ? null : v);
+      if (s !== l.last) { l.last = s; l.cb(snap(v)); }
+    });
+  }
+  const join = (a, b) => [a, b].filter(Boolean).join('/');
+
+  class Ref {
+    constructor(path) { this.path = path || ''; }
+    once() { return Promise.resolve(snap(getPath(readTree(), this.path))); }
+    set(v) { const t = readTree(); setPath(t, this.path, v); writeTree(t); notify(); return Promise.resolve(); }
+    update(obj) {
+      const t = readTree();
+      Object.keys(obj).forEach(k => setPath(t, join(this.path, k), obj[k]));
+      writeTree(t); notify(); return Promise.resolve();
+    }
+    transaction(fn) {
+      const t = readTree();
+      const cur = getPath(t, this.path);
+      const res = fn(cur === undefined ? null : clone(cur));
+      if (res === undefined) return Promise.resolve({ committed: false, snapshot: snap(cur) });
+      setPath(t, this.path, res); writeTree(t); notify();
+      return Promise.resolve({ committed: true, snapshot: snap(res) });
+    }
+    on(evt, cb) {
+      if (this.path === '.info/connected') { cb(snap(true)); return; }
+      const l = { path: this.path, cb, last: '__init__' };
+      listeners.push(l);
+      const v = getPath(readTree(), this.path);
+      l.last = JSON.stringify(v === undefined ? null : v);
+      cb(snap(v));
+    }
+    off(evt, cb) {
+      for (let i = listeners.length - 1; i >= 0; i--)
+        if (listeners[i].path === this.path && (!cb || listeners[i].cb === cb)) listeners.splice(i, 1);
+    }
+  }
+  window.addEventListener('storage', e => { if (e.key === DB_KEY) notify(); });
+  return { ref: p => new Ref(p) };
+})();
+
+let db = LocalDB;
+if (USE_FIREBASE) {
+  firebase.initializeApp(firebaseConfig);
+  db = firebase.database();
+}
+// The practice version keeps ALL its data under "demo/", so it never mixes with the real game
+// (even if both use the same Firebase project or the same browser).
+const GAME_NS = DEMO_MODE ? 'demo' : '';
+const rawDb = db;
+db = { ref: p => rawDb.ref(GAME_NS ? (p ? GAME_NS + '/' + p : GAME_NS) : (p || undefined)) };
+</script>
+</head>
+<body class="bg-slate-100">
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect } = React;
+
+/* ============================ GAME MODEL ============================ */
+const REGIONS = [
+  { id: 'R1', name: 'Pacific',  pos: 1 },
+  { id: 'R2', name: 'Mountain', pos: 2 },
+  { id: 'R3', name: 'Central',  pos: 3 },
+  { id: 'R4', name: 'South',    pos: 4 },
+  { id: 'R5', name: 'Atlantic', pos: 5 },
+];
+const FACTORIES = [
+  { id: 'F1', name: 'Factory 1 (West)',    pos: 1, cap: 700, unitCost: 12 },
+  { id: 'F2', name: 'Factory 2 (Central)', pos: 3, cap: 900, unitCost: 13 },
+  { id: 'F3', name: 'Factory 3 (East)',    pos: 5, cap: 700, unitCost: 11 },
+];
+const WAREHOUSES = REGIONS.map(r => ({ id: 'W' + r.id.slice(1), name: r.name + ' Warehouse', pos: r.pos }));
+const PARAMS = {
+  price: 40, startCash: 50000,
+  openFactory: 5000, fixedFactory: 1000,
+  openWarehouse: 1000, fixedWarehouse: 250,
+  holdF: 0.3, holdW: 0.5,
+  lostPenalty: DEMO_MODE ? 0 : 6,          // no stock-out penalty in the practice game
+  interest: 0.02,
+  leadStd: 2, leadExp: 1, expMult: 2.5,
+};
+// In the practice game every shipment is standard, whatever a stored decision says.
+const effMode = m => (!DEMO_MODE && m === 'exp') ? 'exp' : 'std';
+const shipRate = (f, w, mode) => {
+  const base = 0.8 + 0.4 * Math.abs(f.pos - w.pos);
+  return mode === 'exp' ? base * PARAMS.expMult : base;
+};
+const deliverRate = (w, r) => 1 + 0.7 * Math.abs(w.pos - r.pos);
+
+// ---- helpers
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const toInt = v => { const n = parseInt(v, 10); return isNaN(n) ? 0 : n; };
+const r2 = x => Math.round(x * 100) / 100;
+const money = n => (n < 0 ? '-' : '') + '£' + Math.abs(Math.round(n)).toLocaleString();
+const sum = a => a.reduce((x, y) => x + y, 0);
+const mapObj = (o, fn) => { const r = {}; Object.keys(o).forEach(k => r[k] = fn(o[k], k)); return r; };
+const slug = s => s.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+const download = (filename, text, type) => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+};
+
+// ---- demand (same for every team, generated from the game seed)
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const BASE = [160, 220, 260, 190, 130];
+const TREND = [0.04, 0.03, 0.05, -0.01, 0.08];
+const AMP = [0.15, 0.10, 0.20, 0.10, 0.25];
+const PHASE = [0, 1, 2, 3, 4];
+function demandFor(seed, round) {
+  return REGIONS.map((r, i) => {
+    const rnd = mulberry32(seed * 1000 + round * 10 + i);
+    const noise = (rnd() + rnd() + rnd() - 1.5) * 0.25;
+    const v = BASE[i] * (1 + TREND[i] * (round - 1)) *
+              (1 + AMP[i] * Math.sin(2 * Math.PI * round / 6 + PHASE[i])) * (1 + noise);
+    return Math.max(0, Math.round(v));
+  });
+}
+
+function initialState(name) {
+  return {
+    name, processed: 0, cash: PARAMS.startCash,
+    factories: { F1: { open: false, stock: 0 }, F2: { open: true, stock: 600 }, F3: { open: false, stock: 0 } },
+    warehouses: {
+      W1: { open: false, inv: 0 }, W2: { open: true, inv: 500 }, W3: { open: false, inv: 0 },
+      W4: { open: true, inv: 500 }, W5: { open: false, inv: 0 },
+    },
+    pipeline: [],
+    assignment: { R1: 'W2', R2: 'W2', R3: 'W4', R4: 'W4', R5: 'W4' },
+    lastDecision: null,
+    history: [],
+  };
+}
+
+// If a team did not submit, repeat last round's production/shipping/assignments.
+function defaultDecision(state) {
+  const ld = state.lastDecision;
+  return {
+    factoryOpen: mapObj(state.factories, f => f.open),
+    warehouseOpen: mapObj(state.warehouses, w => w.open),
+    production: ld ? { ...ld.production } : {},
+    ship: ld ? JSON.parse(JSON.stringify(ld.ship)) : {},
+    assign: { ...state.assignment },
+  };
+}
+
+function processRound(s0, dec, demandRow, round) {
+  const s = JSON.parse(JSON.stringify(s0));
+  const c = { revenue: 0, invest: 0, fixed: 0, production: 0, transport: 0, delivery: 0, holding: 0, penalty: 0, interest: 0 };
+  const fo = dec.factoryOpen || {}, wo = dec.warehouseOpen || {};
+  const prod = dec.production || {}, ship = dec.ship || {};
+  const assign = {};
+  REGIONS.forEach(r => { assign[r.id] = (dec.assign && dec.assign[r.id] !== undefined) ? dec.assign[r.id] : s.assignment[r.id]; });
+
+  // 1. open / close facilities (closing writes off stock)
+  FACTORIES.forEach(f => {
+    const cur = s.factories[f.id];
+    const want = fo[f.id] !== undefined ? !!fo[f.id] : cur.open;
+    if (want && !cur.open) { cur.open = true; c.invest += PARAMS.openFactory; }
+    else if (!want && cur.open) { cur.open = false; cur.stock = 0; }
+  });
+  WAREHOUSES.forEach(w => {
+    const cur = s.warehouses[w.id];
+    const want = wo[w.id] !== undefined ? !!wo[w.id] : cur.open;
+    if (want && !cur.open) { cur.open = true; c.invest += PARAMS.openWarehouse; }
+    else if (!want && cur.open) { cur.open = false; cur.inv = 0; }
+  });
+
+  // 2. production
+  FACTORIES.forEach(f => {
+    const cur = s.factories[f.id];
+    if (!cur.open) return;
+    const q = clamp(toInt(prod[f.id]), 0, f.cap);
+    cur.stock += q;
+    c.production += q * f.unitCost;
+  });
+
+  // 3. shipping factory -> warehouse (goes into the pipeline)
+  FACTORIES.forEach(f => {
+    const cur = s.factories[f.id];
+    if (!cur.open) return;
+    WAREHOUSES.forEach(w => {
+      if (!s.warehouses[w.id].open) return;
+      const rt = ship[f.id + '>' + w.id];
+      if (!rt) return;
+      const q = clamp(toInt(rt.qty), 0, cur.stock);
+      if (q <= 0) return;
+      const mode = effMode(rt.mode);
+      cur.stock -= q;
+      c.transport += q * shipRate(f, w, mode);
+      s.pipeline.push({ arrive: round + (mode === 'exp' ? PARAMS.leadExp : PARAMS.leadStd), wh: w.id, qty: q, mode, from: f.id });
+    });
+  });
+
+  // 4. sales from assigned warehouse (shared stock is split proportionally)
+  const soldArr = REGIONS.map(() => 0);
+  const byWh = {};
+  REGIONS.forEach((r, i) => { (byWh[assign[r.id]] = byWh[assign[r.id]] || []).push(i); });
+  Object.keys(byWh).forEach(whId => {
+    const w = s.warehouses[whId];
+    if (!w || !w.open) return;
+    const idxs = byWh[whId];
+    const total = sum(idxs.map(i => demandRow[i]));
+    idxs.forEach(i => { soldArr[i] = total <= w.inv ? demandRow[i] : Math.floor(demandRow[i] * w.inv / total); });
+    w.inv -= sum(idxs.map(i => soldArr[i]));
+  });
+  REGIONS.forEach((r, i) => {
+    const wh = WAREHOUSES.find(w => w.id === assign[r.id]);
+    if (wh && soldArr[i] > 0) {
+      c.revenue += soldArr[i] * PARAMS.price;
+      c.delivery += soldArr[i] * deliverRate(wh, r);
+    }
+  });
+  const lostArr = demandRow.map((d, i) => d - soldArr[i]);
+  c.penalty = sum(lostArr) * PARAMS.lostPenalty;   // 0 in the practice game
+
+  // 5. holding, fixed, interest
+  FACTORIES.forEach(f => { if (s.factories[f.id].open) { c.holding += s.factories[f.id].stock * PARAMS.holdF; c.fixed += PARAMS.fixedFactory; } });
+  WAREHOUSES.forEach(w => { if (s.warehouses[w.id].open) { c.holding += s.warehouses[w.id].inv * PARAMS.holdW; c.fixed += PARAMS.fixedWarehouse; } });
+  if (s.cash < 0) c.interest = -s.cash * PARAMS.interest;
+
+  const net = c.revenue - c.invest - c.fixed - c.production - c.transport - c.delivery - c.holding - c.penalty - c.interest;
+  s.cash = r2(s.cash + net);
+
+  // 6. shipments arriving at the start of next round (lost if warehouse was closed)
+  const next = round + 1;
+  s.pipeline = s.pipeline.filter(p => {
+    if (p.arrive <= next) { const w = s.warehouses[p.wh]; if (w.open) w.inv += p.qty; return false; }
+    return true;
+  });
+
+  s.history.push({
+    round, demand: demandRow, sold: soldArr, lost: lostArr,
+    ...mapObj(c, v => r2(v)), net: r2(net), cash: s.cash,
+  });
+  s.assignment = assign;
+  s.lastDecision = { production: prod, ship, assign };
+  s.processed = round;
+  return s;
+}
+
+/* ========================= DATA SYNC ========================= */
+// Brings a team's saved state up to date with all CLOSED rounds.
+async function syncTeam(teamId, game) {
+  const lastClosed = Math.min(game.round - 1, game.totalRounds);
+  const stateRef = db.ref('state/' + teamId);
+  const snap = await stateRef.once('value');
+  const cur = snap.val();
+  if (!cur) return;
+  if (cur.processed >= lastClosed) return;
+  const decSnap = await db.ref('decisions/' + teamId).once('value');
+  const decs = decSnap.val() || {};
+  const res = await stateRef.transaction(c => {
+    if (!c) return c;
+    if (c.processed >= lastClosed) return; // already done
+    let s = JSON.parse(c.json);
+    for (let r = s.processed + 1; r <= lastClosed; r++) {
+      const raw = decs['r' + r];
+      const dec = raw ? JSON.parse(raw) : defaultDecision(s);
+      s = processRound(s, dec, demandFor(game.seed, r), r);
+    }
+    return { processed: s.processed, json: JSON.stringify(s) };
+  });
+  const fin = res.snapshot.val();
+  if (fin) {
+    const s = JSON.parse(fin.json);
+    await db.ref('leaderboard/' + teamId).update({ name: s.name, cash: s.cash, rounds: s.processed });
+  }
+}
+async function syncAllTeams(game) {
+  const snap = await db.ref('teams').once('value');
+  const ids = Object.keys(snap.val() || {});
+  for (const id of ids) { await syncTeam(id, game); }
+}
+
+/* ============================ UI PIECES ============================ */
+const Card = ({ title, right, children }) => (
+  <div className="bg-white rounded-xl shadow p-5 mb-5">
+    {(title || right) && (
+      <div className="flex justify-between items-center mb-3">
+        <h2 className="text-lg font-bold text-slate-800">{title}</h2>{right}
+      </div>)}
+    {children}
+  </div>
+);
+const NumInput = ({ value, onChange, max, disabled }) => (
+  <input type="number" min="0" max={max} disabled={disabled}
+    value={value ? value : ''} placeholder="0"
+    onChange={e => onChange(clamp(toInt(e.target.value), 0, max !== undefined ? max : 1e9))}
+    className="w-24 px-2 py-1 border border-slate-300 rounded text-right disabled:bg-slate-100" />
+);
+
+const PracticeNotice = () => DEMO_MODE ? (
+  <div className="bg-amber-50 border border-amber-300 text-amber-900 rounded-lg p-3 mb-5 text-sm">
+    <b>🧪 PRACTICE VERSION.</b> Use this to learn the game before the real one. Differences from the real game:
+    all shipments are <b>standard only</b> (they arrive after {PARAMS.leadStd} rounds, no express shipping) and there is <b>no stock-out penalty</b> (demand you cannot serve is simply lost).
+    Scores here do not count.
+  </div>
+) : null;
+
+function Leaderboard({ rows, myId }) {
+  const sorted = [...rows].sort((a, b) => b.cash - a.cash);
+  if (!sorted.length) return <p className="text-slate-500 text-sm">No teams yet.</p>;
+  return (
+    <div className="space-y-2">
+      {sorted.map((t, i) => (
+        <div key={t.id} className={`flex justify-between items-center px-4 py-2 rounded ${t.id === myId ? 'bg-indigo-100 border-2 border-indigo-500' : i < 3 ? 'bg-amber-50 border border-amber-300' : 'bg-slate-50'}`}>
+          <div className="flex items-center gap-3">
+            <span className="font-bold text-lg w-8">#{i + 1}</span>
+            <div>
+              <div className="font-semibold">{t.name}</div>
+              <div className="text-xs text-slate-500">{t.rounds} round{t.rounds === 1 ? '' : 's'} completed</div>
+            </div>
+          </div>
+          <span className={`font-semibold text-lg ${t.cash >= 0 ? 'text-green-700' : 'text-red-600'}`}>{money(t.cash)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ============================ MAP ============================ */
+// Save the map picture as "supply-map.png" in the SAME folder as this HTML file.
+const MAP_FILE = 'supply-map.png';
+
+function MapCard({ bare }) {
+  const [failed, setFailed] = useState(false);
+  if (DEMO_MODE) return null;   // the practice version has no map
+  const body = (
+    <div>
+      {failed ? (
+        <p className="text-sm text-amber-700 bg-amber-50 border border-amber-200 p-3 rounded mb-3">
+          Map image not found. Save the map picture as <b>{MAP_FILE}</b> in the same folder as this HTML file (and upload it together with the HTML file if you host the game online).
+        </p>
+      ) : (
+        <img src={MAP_FILE} alt="Map of the five regions (Pacific, Mountain, Central, South, Atlantic) and the three factory locations"
+          className="w-full rounded-lg border border-slate-200 mb-3" onError={() => setFailed(true)} />
+      )}
+      <p className="text-xs text-slate-600">
+        The market has five regions: Pacific, Mountain, Central, South and Atlantic. The three possible factories are <b>Factory 1 (West, in Pacific)</b>,
+        {' '}<b>Factory 2 (Central)</b> and <b>Factory 3 (East, in Atlantic)</b>. A warehouse can be opened in each of the five regions.
+        Shipping and delivery costs are listed on the "Game info &amp; demand" tab.
+      </p>
+    </div>
+  );
+  return bare
+    ? <div className="mb-5">{body}</div>
+    : <Card title="🗺️ The network: regions and factories">{body}</Card>;
+}
+
+/* ======================== DEMAND HISTORY ======================== */
+// Six periods "before the game" (-6 ... -1), generated from the same seed and the
+// same pattern as the real rounds, so students can study trend and seasonality.
+const HIST_N = 6;
+function pastDemand(seed) {
+  const rows = [];
+  for (let k = HIST_N; k >= 1; k--) rows.push({ label: '−' + k, demand: demandFor(seed, 1 - k) });
+  return rows;
+}
+const REGION_COLORS = ['#2563eb', '#16a34a', '#d97706', '#dc2626', '#7c3aed'];
+
+function DemandHistory({ seed, realized, bare }) {
+  const past = pastDemand(seed);
+  const live = (realized || []).map(h => ({ label: 'R' + h.round, demand: h.demand, live: true }));
+  const rows = [...past, ...live];
+  const avg = REGIONS.map((r, i) => Math.round(sum(past.map(p => p.demand[i])) / past.length));
+  const chg = REGIONS.map((r, i) => {
+    const a = sum(past.slice(0, 3).map(p => p.demand[i])) / 3;
+    const b = sum(past.slice(-3).map(p => p.demand[i])) / 3;
+    return a > 0 ? Math.round((b / a - 1) * 100) : 0;
+  });
+
+  const W = 640, H = 240, L = 44, R = 12, T = 12, B = 28;
+  const maxV = (Math.max(...rows.flatMap(r => r.demand)) * 1.1) || 1;
+  const x = idx => L + (rows.length === 1 ? 0 : idx * (W - L - R) / (rows.length - 1));
+  const y = v => T + (H - T - B) * (1 - v / maxV);
+  const splitX = live.length > 0 ? (x(past.length - 1) + x(past.length)) / 2 : null;
+
+  const chart = (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto mb-2">
+      {[0, 0.25, 0.5, 0.75, 1].map(f => {
+        const v = maxV * f;
+        return (<g key={f}>
+          <line x1={L} x2={W - R} y1={y(v)} y2={y(v)} stroke="#e2e8f0" />
+          <text x={L - 6} y={y(v) + 4} fontSize="10" textAnchor="end" fill="#64748b">{Math.round(v)}</text>
+        </g>);
+      })}
+      {rows.map((r, i) => <text key={i} x={x(i)} y={H - 8} fontSize="10" textAnchor="middle" fill="#64748b">{r.label}</text>)}
+      {splitX !== null && <line x1={splitX} x2={splitX} y1={T} y2={H - B} stroke="#94a3b8" strokeDasharray="4 3" />}
+      {REGIONS.map((reg, i) => (
+        <polyline key={reg.id} fill="none" stroke={REGION_COLORS[i]} strokeWidth="2"
+          points={rows.map((r, j) => `${x(j)},${y(r.demand[i])}`).join(' ')} />))}
+      {REGIONS.map((reg, i) => rows.map((r, j) => (
+        <circle key={reg.id + j} cx={x(j)} cy={y(r.demand[i])} r="2.5" fill={REGION_COLORS[i]} />)))}
+    </svg>
+  );
+
+  const body = (
+    <div>
+      <p className="text-xs text-slate-600 mb-3">
+        Periods <b>−6 … −1</b> happened before the game starts (−1 is the most recent). Rows starting with <b>R</b> are actual game rounds and appear as they are played.
+        Each region has its own trend, seasonal swings and random noise, and the same pattern carries on during the game, so use this history to forecast demand.
+      </p>
+      {chart}
+      <div className="flex flex-wrap gap-4 text-xs mb-3">
+        {REGIONS.map((r, i) => (
+          <span key={r.id} className="flex items-center gap-1">
+            <span className="inline-block w-3 h-3 rounded-full" style={{ background: REGION_COLORS[i] }}></span>{r.name}
+          </span>))}
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-600">
+            <tr>
+              <th className="px-2 py-1 text-left">Period</th>
+              {REGIONS.map((r, i) => <th key={r.id} className="px-2 py-1 text-right" style={{ color: REGION_COLORS[i] }}>{r.name}</th>)}
+              <th className="px-2 py-1 text-right">Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {past.map(r => (
+              <tr key={r.label} className="border-t text-right">
+                <td className="px-2 py-1 text-left">{r.label}</td>
+                {r.demand.map((d, i) => <td key={i} className="px-2 py-1">{d}</td>)}
+                <td className="px-2 py-1 font-semibold">{sum(r.demand)}</td>
+              </tr>))}
+            <tr className="border-t-2 border-slate-300 text-right bg-slate-50 font-semibold">
+              <td className="px-2 py-1 text-left">Average (periods −6 to −1)</td>
+              {avg.map((a, i) => <td key={i} className="px-2 py-1">{a}</td>)}
+              <td className="px-2 py-1">{sum(avg)}</td>
+            </tr>
+            <tr className="text-right bg-slate-50">
+              <td className="px-2 py-1 text-left">Last 3 vs first 3 periods</td>
+              {chg.map((c, i) => <td key={i} className={`px-2 py-1 ${c > 0 ? 'text-green-700' : c < 0 ? 'text-red-600' : ''}`}>{c > 0 ? '+' : ''}{c}%</td>)}
+              <td className="px-2 py-1"></td>
+            </tr>
+            {live.map(r => (
+              <tr key={r.label} className="border-t text-right bg-indigo-50">
+                <td className="px-2 py-1 text-left">{r.label} (actual)</td>
+                {r.demand.map((d, i) => <td key={i} className="px-2 py-1">{d}</td>)}
+                <td className="px-2 py-1 font-semibold">{sum(r.demand)}</td>
+              </tr>))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+  return bare
+    ? <div className="mt-6 pt-5 border-t"><h2 className="text-lg font-bold text-slate-800 mb-3">📈 Past demand by region</h2>{body}</div>
+    : <Card title="📈 Demand history by region">{body}</Card>;
+}
+
+/* ============================== LOGIN ============================== */
+function Login({ game, leaderboard, onLogin, onInstructor }) {
+  const [name, setName] = useState('');
+  const [pass, setPass] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const create = async () => {
+    setErr('');
+    const id = slug(name);
+    if (!id || !pass.trim()) { setErr('Enter a team name and a team passcode.'); return; }
+    setBusy(true);
+    try {
+      const ex = await db.ref('teams/' + id).once('value');
+      if (ex.exists()) { setErr('That team name is taken. Use "Join" if it is your team.'); setBusy(false); return; }
+      const st = initialState(name.trim());
+      await db.ref('teams/' + id).set({ name: name.trim(), pass: pass.trim() });
+      await db.ref('state/' + id).set({ processed: 0, json: JSON.stringify(st) });
+      await db.ref('leaderboard/' + id).set({ name: name.trim(), cash: st.cash, rounds: 0 });
+      onLogin({ id, name: name.trim() });
+    } catch (e) { setErr('Error: ' + e.message); }
+    setBusy(false);
+  };
+  const join = async () => {
+    setErr('');
+    const id = slug(name);
+    if (!id) { setErr('Enter your team name.'); return; }
+    setBusy(true);
+    try {
+      const t = (await db.ref('teams/' + id).once('value')).val();
+      if (!t) setErr('Team not found.');
+      else if (t.pass !== pass.trim()) setErr('Wrong passcode.');
+      else onLogin({ id, name: t.name });
+    } catch (e) { setErr('Error: ' + e.message); }
+    setBusy(false);
+  };
+
+  return (
+    <div className="min-h-screen p-6">
+      <div className="max-w-3xl mx-auto">
+        <div className="bg-white rounded-xl shadow-lg p-8 mb-5">
+          <h1 className="text-3xl font-bold text-slate-800 mb-1">🏭 Supply Network Game{DEMO_MODE ? ' — Practice version' : ''}</h1>
+          <p className="text-slate-600 mb-4">Run a network of factories and warehouses serving five regions. Your score is your final <b>cash position</b>.</p>
+          <PracticeNotice />
+          <MapCard bare />
+          {game === null && <p className="text-amber-700 bg-amber-50 p-3 rounded">No game has been started yet. The instructor must create one first (see "Instructor login" below).</p>}
+          {game && (
+            <>
+              <p className="text-sm text-slate-600 mb-4">Game status: round <b>{Math.min(game.round, game.totalRounds)}</b> of <b>{game.totalRounds}</b>{game.round > game.totalRounds ? ' (finished)' : ''}</p>
+              <div className="grid md:grid-cols-2 gap-3 mb-3">
+                <input value={name} onChange={e => setName(e.target.value)} placeholder="Team name" className="px-3 py-2 border border-slate-300 rounded" />
+                <input value={pass} onChange={e => setPass(e.target.value)} placeholder="Team passcode" className="px-3 py-2 border border-slate-300 rounded" />
+              </div>
+              <div className="flex gap-3">
+                <button disabled={busy} onClick={join} className="flex-1 bg-indigo-600 text-white py-2 rounded font-semibold hover:bg-indigo-700 disabled:bg-slate-300">Join existing team</button>
+                <button disabled={busy || game.round > 1} onClick={create} className="flex-1 bg-emerald-600 text-white py-2 rounded font-semibold hover:bg-emerald-700 disabled:bg-slate-300" title={game.round > 1 ? 'New teams can only be created during round 1' : ''}>Create new team</button>
+              </div>
+              {err && <p className="text-red-600 text-sm mt-3">{err}</p>}
+            </>
+          )}
+          {game && <DemandHistory seed={game.seed} bare />}
+          <button onClick={onInstructor} className="text-xs text-slate-400 underline mt-5">Instructor login</button>
+        </div>
+        <Card title="🏆 Leaderboard"><Leaderboard rows={leaderboard} /></Card>
+      </div>
+    </div>
+  );
+}
+
+/* ============================ TEAM VIEW ============================ */
+function previewCosts(state, dec) {
+  let invest = 0, fixed = 0, production = 0, transport = 0;
+  FACTORIES.forEach(f => {
+    const open = !!dec.factoryOpen[f.id];
+    if (!open) return;
+    if (!state.factories[f.id].open) invest += PARAMS.openFactory;
+    fixed += PARAMS.fixedFactory;
+    production += clamp(toInt(dec.production[f.id]), 0, f.cap) * f.unitCost;
+  });
+  WAREHOUSES.forEach(w => {
+    if (!dec.warehouseOpen[w.id]) return;
+    if (!state.warehouses[w.id].open) invest += PARAMS.openWarehouse;
+    fixed += PARAMS.fixedWarehouse;
+  });
+  FACTORIES.forEach(f => {
+    if (!dec.factoryOpen[f.id]) return;
+    let avail = (state.factories[f.id].open ? state.factories[f.id].stock : 0) + clamp(toInt(dec.production[f.id]), 0, f.cap);
+    WAREHOUSES.forEach(w => {
+      if (!dec.warehouseOpen[w.id]) return;
+      const r = dec.ship[f.id + '>' + w.id];
+      if (!r) return;
+      const q = Math.min(toInt(r.qty), avail);
+      if (q <= 0) return;
+      avail -= q;
+      transport += q * shipRate(f, w, effMode(r.mode));
+    });
+  });
+  return { invest, fixed, production, transport, total: invest + fixed + production + transport };
+}
+
+function DecideTab({ team, state, game }) {
+  const round = game.round;
+  const upToDate = state.processed === round - 1;
+  const [dec, setDec] = useState(null);
+  const [saved, setSaved] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!upToDate) return;
+    let cancelled = false;
+    db.ref(`decisions/${team.id}/r${round}`).once('value').then(snap => {
+      if (cancelled) return;
+      const v = snap.val();
+      if (v) { setDec(JSON.parse(v)); setSaved(true); }
+      else { setDec(defaultDecision(state)); setSaved(false); }
+    });
+    return () => { cancelled = true; };
+  }, [round, upToDate, team.id]);
+
+  if (!upToDate) return <Card><p className="text-slate-600">Updating your results from previous rounds… (if this stays for more than a few seconds, reload the page)</p></Card>;
+  if (!dec) return <Card><p className="text-slate-600">Loading…</p></Card>;
+
+  const edit = fn => { setDec(d => fn(JSON.parse(JSON.stringify(d)))); setSaved(false); };
+  const openW = WAREHOUSES.filter(w => dec.warehouseOpen[w.id]);
+  const pv = previewCosts(state, dec);
+  const lastDemand = state.history.length ? state.history[state.history.length - 1].demand : null;
+
+  const submit = async () => {
+    setBusy(true);
+    try { await db.ref(`decisions/${team.id}/r${round}`).set(JSON.stringify(dec)); setSaved(true); }
+    catch (e) { alert('Could not save: ' + e.message); }
+    setBusy(false);
+  };
+
+  return (
+    <div>
+      <PracticeNotice />
+      <div className={`rounded-xl p-4 mb-5 ${saved ? 'bg-green-50 border border-green-300 text-green-800' : 'bg-amber-50 border border-amber-300 text-amber-800'}`}>
+        {saved ? `✅ Round ${round} decisions saved. You can still change them until the instructor closes the round.`
+               : `⚠️ Round ${round} decisions are NOT saved yet. If you do not submit, last round's production, shipping and assignments are repeated automatically.`}
+      </div>
+
+      <Card title="1. Factories & production">
+        <div className="grid md:grid-cols-3 gap-4">
+          {FACTORIES.map(f => {
+            const cur = state.factories[f.id];
+            const open = !!dec.factoryOpen[f.id];
+            return (
+              <div key={f.id} className={`border-2 rounded-lg p-3 ${open ? 'border-green-500 bg-green-50' : 'border-slate-300'}`}>
+                <div className="flex justify-between items-center mb-1">
+                  <b>{f.name}</b>
+                  <button onClick={() => edit(d => { d.factoryOpen[f.id] = !open; if (open) d.production[f.id] = 0; return d; })}
+                    className={`px-3 py-1 rounded text-sm font-semibold ${open ? 'bg-green-600 text-white' : 'bg-slate-200'}`}>{open ? 'Open' : 'Closed'}</button>
+                </div>
+                <div className="text-xs text-slate-600 mb-2">Capacity {f.cap}/round · £{f.unitCost}/unit · fixed {money(PARAMS.fixedFactory)}/round</div>
+                <div className="text-xs mb-1">Stock on hand: <b>{cur.open ? cur.stock : 0}</b></div>
+                {!cur.open && open && <div className="text-xs text-amber-700 mb-1">Opening cost {money(PARAMS.openFactory)} this round</div>}
+                {cur.open && !open && <div className="text-xs text-red-600 mb-1">Closing writes off {cur.stock} units of stock</div>}
+                {open && (<div className="flex items-center gap-2 text-sm">Produce <NumInput value={dec.production[f.id]} max={f.cap} onChange={q => edit(d => { d.production[f.id] = q; return d; })} /></div>)}
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      <Card title="2. Warehouses (where inventory is stored)">
+        <div className="grid md:grid-cols-5 gap-3">
+          {WAREHOUSES.map(w => {
+            const cur = state.warehouses[w.id];
+            const open = !!dec.warehouseOpen[w.id];
+            return (
+              <div key={w.id} className={`border-2 rounded-lg p-3 ${open ? 'border-green-500 bg-green-50' : 'border-slate-300'}`}>
+                <b className="text-sm">{w.name}</b>
+                <div className="text-xs text-slate-600">Fixed {money(PARAMS.fixedWarehouse)}/round</div>
+                <div className="text-xs mb-2">Inventory: <b>{cur.open ? cur.inv : 0}</b></div>
+                {!cur.open && open && <div className="text-xs text-amber-700 mb-1">Opening cost {money(PARAMS.openWarehouse)}</div>}
+                {cur.open && !open && <div className="text-xs text-red-600 mb-1">Closing writes off {cur.inv} units</div>}
+                <button onClick={() => edit(d => { d.warehouseOpen[w.id] = !open; return d; })}
+                  className={`w-full px-2 py-1 rounded text-sm font-semibold ${open ? 'bg-green-600 text-white' : 'bg-slate-200'}`}>{open ? 'Open' : 'Closed'}</button>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      <Card title="3. Shipping: factory → warehouse">
+        <p className="text-xs text-slate-600 mb-3">
+          {DEMO_MODE
+            ? `All shipments are standard: they arrive ${PARAMS.leadStd} rounds after they are shipped. Goods in transit cannot be sold until they arrive.`
+            : `Standard shipping arrives in ${PARAMS.leadStd} rounds, express in ${PARAMS.leadExp} round (cost ×${PARAMS.expMult}). Goods in transit cannot be sold until they arrive.`}
+        </p>
+        {FACTORIES.filter(f => dec.factoryOpen[f.id]).length === 0 && <p className="text-slate-500 text-sm">Open a factory to ship goods.</p>}
+        {FACTORIES.filter(f => dec.factoryOpen[f.id]).map(f => {
+          const avail = (state.factories[f.id].open ? state.factories[f.id].stock : 0) + clamp(toInt(dec.production[f.id]), 0, f.cap);
+          const shipped = sum(openW.map(w => { const r = dec.ship[f.id + '>' + w.id]; return r ? toInt(r.qty) : 0; }));
+          return (
+            <div key={f.id} className="mb-4">
+              <div className="font-semibold text-sm mb-1">{f.name} — available to ship: {avail}
+                {shipped > avail && <span className="text-red-600 ml-2">⚠ shipping {shipped} exceeds available; extra will be ignored</span>}
+              </div>
+              <table className="w-full text-sm">
+                <thead className="bg-slate-50 text-slate-600"><tr>
+                  <th className="text-left px-2 py-1">To</th>
+                  <th className="px-2 py-1">{DEMO_MODE ? 'Shipping £/unit' : 'Std £/unit'}</th>
+                  {!DEMO_MODE && <th className="px-2 py-1">Express £/unit</th>}
+                  <th className="px-2 py-1">Quantity</th>
+                  {!DEMO_MODE && <th className="px-2 py-1">Mode</th>}
+                </tr></thead>
+                <tbody>
+                  {openW.map(w => {
+                    const key = f.id + '>' + w.id;
+                    const r = dec.ship[key] || { qty: 0, mode: 'std' };
+                    return (
+                      <tr key={key} className="border-t">
+                        <td className="px-2 py-1">{w.name}</td>
+                        <td className="px-2 py-1 text-center">£{shipRate(f, w, 'std').toFixed(2)}</td>
+                        {!DEMO_MODE && <td className="px-2 py-1 text-center">£{shipRate(f, w, 'exp').toFixed(2)}</td>}
+                        <td className="px-2 py-1 text-center"><NumInput value={r.qty} onChange={q => edit(d => { d.ship[key] = { qty: q, mode: DEMO_MODE ? 'std' : r.mode }; return d; })} /></td>
+                        {!DEMO_MODE && (
+                          <td className="px-2 py-1 text-center">
+                            <select value={r.mode} onChange={e => edit(d => { d.ship[key] = { qty: r.qty, mode: e.target.value }; return d; })} className="border border-slate-300 rounded px-1 py-1">
+                              <option value="std">Standard</option><option value="exp">Express</option></select></td>)}
+                      </tr>);
+                  })}
+                </tbody>
+              </table>
+            </div>);
+        })}
+        {state.pipeline.length > 0 && (
+          <div className="mt-2 text-sm bg-blue-50 border border-blue-200 rounded p-3">
+            <b>In transit:</b> {state.pipeline.map((p, i) => <span key={i} className="mr-3">{p.qty} units → {WAREHOUSES.find(w => w.id === p.wh).name} (arrives start of round {p.arrive})</span>)}
+          </div>)}
+      </Card>
+
+      <Card title="4. Which warehouse serves each region?">
+        <p className="text-xs text-slate-600 mb-3">
+          Each region buys from ONE warehouse. Sales are limited by that warehouse's inventory;{' '}
+          {DEMO_MODE ? 'demand you cannot serve is simply lost (there is no stock-out penalty in this practice game).' : `unmet demand costs ${money(PARAMS.lostPenalty)}/unit.`}{' '}
+          If several regions share a warehouse with too little stock, it is split proportionally to demand. See the "Game info &amp; demand" tab for {DEMO_MODE ? 'the demand history' : 'the map and the demand history'}.
+        </p>
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-600"><tr>
+            <th className="text-left px-2 py-1">Region</th><th className="px-2 py-1">Last round demand</th><th className="px-2 py-1">Served from</th><th className="px-2 py-1">Delivery £/unit</th></tr></thead>
+          <tbody>
+            {REGIONS.map((r, i) => {
+              const wid = dec.assign[r.id];
+              const w = WAREHOUSES.find(x => x.id === wid);
+              const valid = w && dec.warehouseOpen[w.id];
+              return (
+                <tr key={r.id} className="border-t">
+                  <td className="px-2 py-1">{r.name}</td>
+                  <td className="px-2 py-1 text-center">{lastDemand ? lastDemand[i] : '—'}</td>
+                  <td className="px-2 py-1 text-center">
+                    <select value={valid ? wid : ''} onChange={e => edit(d => { d.assign[r.id] = e.target.value; return d; })} className="border border-slate-300 rounded px-1 py-1">
+                      <option value="">None (no sales)</option>
+                      {openW.map(x => <option key={x.id} value={x.id}>{x.name}</option>)}
+                    </select></td>
+                  <td className="px-2 py-1 text-center">{valid ? '£' + deliverRate(w, r).toFixed(2) : '—'}</td>
+                </tr>);
+            })}
+          </tbody>
+        </table>
+      </Card>
+
+      <Card title="Committed spending this round">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm">
+          <div>Investments<br /><b>{money(pv.invest)}</b></div>
+          <div>Fixed costs<br /><b>{money(pv.fixed)}</b></div>
+          <div>Production<br /><b>{money(pv.production)}</b></div>
+          <div>Shipping<br /><b>{money(pv.transport)}</b></div>
+          <div>Total<br /><b className="text-lg">{money(pv.total)}</b></div>
+        </div>
+        <p className="text-xs text-slate-500 mt-2">Not included: delivery to regions and holding costs{DEMO_MODE ? '' : ', plus stock-out penalties'} (deducted after sales). Your cash can go negative, but debt costs {PARAMS.interest * 100}% interest per round.</p>
+        <button disabled={busy} onClick={submit} className="mt-4 w-full bg-indigo-600 text-white py-3 rounded-lg font-semibold hover:bg-indigo-700 disabled:bg-slate-300">
+          {saved ? '💾 Saved — click to re-save' : `📤 Submit Round ${round} decisions`}</button>
+      </Card>
+    </div>
+  );
+}
+
+function ResultsTab({ state }) {
+  const h = [...state.history].reverse();
+  if (!h.length) return <Card><p className="text-slate-600">No results yet. Results appear after the instructor closes a round.</p></Card>;
+  const cols = ['Round', 'Revenue', 'Invest', 'Fixed', 'Production', 'Shipping', 'Delivery', 'Holding', ...(DEMO_MODE ? [] : ['Stock-out']), 'Interest', 'Net', 'Cash'];
+  return (
+    <div>
+      <Card title="Financial results by round">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-slate-600"><tr>
+              {cols.map(x => <th key={x} className="px-2 py-1 text-right first:text-left">{x}</th>)}
+            </tr></thead>
+            <tbody>
+              {h.map(r => (
+                <tr key={r.round} className="border-t text-right">
+                  <td className="px-2 py-1 text-left">{r.round}</td>
+                  <td className="px-2 py-1">{money(r.revenue)}</td><td className="px-2 py-1">{money(r.invest)}</td>
+                  <td className="px-2 py-1">{money(r.fixed)}</td><td className="px-2 py-1">{money(r.production)}</td>
+                  <td className="px-2 py-1">{money(r.transport)}</td><td className="px-2 py-1">{money(r.delivery)}</td>
+                  <td className="px-2 py-1">{money(r.holding)}</td>
+                  {!DEMO_MODE && <td className="px-2 py-1 text-red-600">{money(r.penalty)}</td>}
+                  <td className="px-2 py-1">{money(r.interest)}</td>
+                  <td className={`px-2 py-1 font-semibold ${r.net >= 0 ? 'text-green-700' : 'text-red-600'}`}>{money(r.net)}</td>
+                  <td className="px-2 py-1 font-semibold">{money(r.cash)}</td>
+                </tr>))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+      <Card title="Demand history (use it to forecast!)">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-slate-600"><tr><th className="px-2 py-1 text-left">Round</th>
+              {REGIONS.map(r => <th key={r.id} className="px-2 py-1 text-right">{r.name} (sold / demand)</th>)}</tr></thead>
+            <tbody>
+              {h.map(r => (
+                <tr key={r.round} className="border-t text-right">
+                  <td className="px-2 py-1 text-left">{r.round}</td>
+                  {REGIONS.map((reg, i) => <td key={reg.id} className={`px-2 py-1 ${r.lost[i] > 0 ? 'text-red-600' : ''}`}>{r.sold[i]} / {r.demand[i]}</td>)}
+                </tr>))}
+            </tbody>
+          </table>
+        </div>
+        <p className="text-xs text-slate-500 mt-2">Red = some demand was lost (stock-out or no warehouse assigned).</p>
+      </Card>
+    </div>
+  );
+}
+
+function NetworkTab() {
+  return (
+    <div>
+      <PracticeNotice />
+      <Card title="Key economics">
+        <ul className="text-sm text-slate-700 space-y-1 list-disc list-inside">
+          <li>Selling price: <b>£{PARAMS.price}</b> per unit. Starting cash: {money(PARAMS.startCash)}.</li>
+          <li>Factory: open {money(PARAMS.openFactory)}, fixed {money(PARAMS.fixedFactory)}/round. Warehouse: open {money(PARAMS.openWarehouse)}, fixed {money(PARAMS.fixedWarehouse)}/round.</li>
+          <li>Holding cost per unit per round: factory £{PARAMS.holdF}, warehouse £{PARAMS.holdW}.{' '}
+            {DEMO_MODE ? 'There is no stock-out penalty in this practice game: demand you cannot serve is simply lost.' : `Stock-out penalty: £${PARAMS.lostPenalty}/unit.`}</li>
+          <li>{DEMO_MODE
+            ? `Shipping is standard only: goods arrive ${PARAMS.leadStd} rounds after they are shipped.`
+            : `Standard shipping takes ${PARAMS.leadStd} rounds; express takes ${PARAMS.leadExp} round at ×${PARAMS.expMult} the cost.`}</li>
+          <li>Closing a facility writes off its stock. Shipments arriving at a closed warehouse are lost.</li>
+          <li>Demand differs by region (trend, seasonality, randomness) and is identical for all teams.</li>
+        </ul>
+      </Card>
+      <Card title={DEMO_MODE ? `Factory → warehouse shipping (£/unit, standard, ${PARAMS.leadStd}-round lead time)` : 'Factory → warehouse shipping (£/unit, standard / express)'}>
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50"><tr><th className="text-left px-2 py-1">From \ To</th>{WAREHOUSES.map(w => <th key={w.id} className="px-2 py-1">{w.name.replace(' Warehouse', '')}</th>)}</tr></thead>
+          <tbody>{FACTORIES.map(f => (
+            <tr key={f.id} className="border-t text-center"><td className="px-2 py-1 text-left">{f.name} ({f.cap}/rd, £{f.unitCost}/unit)</td>
+              {WAREHOUSES.map(w => <td key={w.id} className="px-2 py-1">{DEMO_MODE ? shipRate(f, w, 'std').toFixed(2) : shipRate(f, w, 'std').toFixed(2) + ' / ' + shipRate(f, w, 'exp').toFixed(2)}</td>)}</tr>))}</tbody>
+        </table>
+      </Card>
+      <Card title="Warehouse → region delivery (£/unit)">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50"><tr><th className="text-left px-2 py-1">From \ To</th>{REGIONS.map(r => <th key={r.id} className="px-2 py-1">{r.name}</th>)}</tr></thead>
+          <tbody>{WAREHOUSES.map(w => (
+            <tr key={w.id} className="border-t text-center"><td className="px-2 py-1 text-left">{w.name}</td>
+              {REGIONS.map(r => <td key={r.id} className="px-2 py-1">{deliverRate(w, r).toFixed(2)}</td>)}</tr>))}</tbody>
+        </table>
+      </Card>
+    </div>
+  );
+}
+
+function TeamView({ team, game, leaderboard, onLogout }) {
+  const [state, setState] = useState(undefined);
+  const [tab, setTab] = useState('decide');
+
+  useEffect(() => {
+    const ref = db.ref('state/' + team.id);
+    const cb = snap => { const v = snap.val(); setState(v ? JSON.parse(v.json) : null); };
+    ref.on('value', cb);
+    return () => ref.off('value', cb);
+  }, [team.id]);
+
+  useEffect(() => { syncTeam(team.id, game).catch(console.error); }, [game.round, game.totalRounds, game.seed, team.id]);
+
+  if (state === undefined) return <div className="p-8">Loading…</div>;
+  if (state === null) return <div className="p-8">This team no longer exists. <button className="underline" onClick={onLogout}>Back</button></div>;
+
+  const finished = game.round > game.totalRounds;
+  const tabs = [...(finished ? [] : [['decide', 'Decisions']]), ['results', 'Results'], ['network', 'Game info & demand'], ['board', 'Leaderboard']];
+  const active = tabs.find(t => t[0] === tab) ? tab : tabs[0][0];
+  const sorted = [...leaderboard].sort((a, b) => b.cash - a.cash);
+  const rank = sorted.findIndex(t => t.id === team.id) + 1;
+
+  return (
+    <div className="min-h-screen p-4 md:p-6">
+      <div className="max-w-5xl mx-auto">
+        <div className="bg-white rounded-xl shadow p-5 mb-5 flex flex-wrap justify-between items-center gap-3">
+          <div>
+            <h1 className="text-2xl font-bold text-slate-800">{team.name}{DEMO_MODE && <span className="ml-3 text-xs align-middle bg-amber-100 text-amber-800 px-2 py-1 rounded-full">PRACTICE</span>}</h1>
+            <p className="text-slate-600 text-sm">{finished ? 'Game finished' : `Round ${game.round} of ${game.totalRounds} in progress`}{rank > 0 && ` · Rank #${rank} of ${sorted.length}`}</p>
+          </div>
+          <div className="text-right">
+            <div className="text-xs text-slate-500">Cash (after {state.processed} closed round{state.processed === 1 ? '' : 's'})</div>
+            <div className={`text-3xl font-bold ${state.cash >= 0 ? 'text-green-700' : 'text-red-600'}`}>{money(state.cash)}</div>
+            <button onClick={onLogout} className="text-xs text-slate-400 underline">Log out</button>
+          </div>
+        </div>
+        {finished && <div className="bg-indigo-50 border border-indigo-300 rounded-xl p-4 mb-5 text-indigo-900">🏁 The game is over. Final cash: <b>{money(state.cash)}</b>.</div>}
+        <div className="flex gap-2 mb-5 flex-wrap">
+          {tabs.map(([k, label]) => (
+            <button key={k} onClick={() => setTab(k)} className={`px-4 py-2 rounded-lg font-semibold ${active === k ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700 shadow'}`}>{label}</button>))}
+        </div>
+        {active === 'decide' && <DecideTab team={team} state={state} game={game} />}
+        {active === 'results' && <ResultsTab state={state} />}
+        {active === 'network' && <><MapCard /><DemandHistory seed={game.seed} realized={state.history} /><NetworkTab /></>}
+        {active === 'board' && <Card title="🏆 Leaderboard (ranked by cash)"><Leaderboard rows={leaderboard} myId={team.id} /></Card>}
+      </div>
+    </div>
+  );
+}
+
+/* =========================== INSTRUCTOR =========================== */
+function Instructor({ game, leaderboard, onExit }) {
+  const [totalRounds, setTotalRounds] = useState(DEMO_MODE ? 6 : 12);
+  const [seed, setSeed] = useState(Math.floor(Math.random() * 9000) + 1000);
+  const [teams, setTeams] = useState({});
+  const [decisions, setDecisions] = useState({});
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const t = db.ref('teams'), d = db.ref('decisions');
+    const tc = s => setTeams(s.val() || {}), dc = s => setDecisions(s.val() || {});
+    t.on('value', tc); d.on('value', dc);
+    return () => { t.off('value', tc); d.off('value', dc); };
+  }, []);
+
+  const startNew = async () => {
+    if (!window.confirm('Start a NEW game? This deletes all teams, decisions and the leaderboard of this version.')) return;
+    setBusy(true);
+    await db.ref().update({ game: { round: 1, totalRounds: toInt(totalRounds) || (DEMO_MODE ? 6 : 12), seed: toInt(seed) || 1 }, teams: null, state: null, decisions: null, leaderboard: null });
+    setBusy(false);
+  };
+  const advance = async () => {
+    if (!window.confirm(`Close round ${game.round} and process all teams?`)) return;
+    setBusy(true);
+    const ng = { ...game, round: game.round + 1 };
+    await db.ref('game/round').set(ng.round);
+    await syncAllTeams(ng);
+    setBusy(false);
+  };
+  const processAll = async () => { setBusy(true); await syncAllTeams(game); setBusy(false); };
+  const removeTeam = async id => {
+    if (!window.confirm('Remove team ' + id + '?')) return;
+    await db.ref().update({ ['teams/' + id]: null, ['state/' + id]: null, ['decisions/' + id]: null, ['leaderboard/' + id]: null });
+  };
+
+  const tag = DEMO_MODE ? 'practice' : 'real';
+  const exportBackup = async () => {
+    const snap = await db.ref().once('value');
+    const v = snap.val() || {};
+    const data = { game: v.game || null, teams: v.teams || null, state: v.state || null, decisions: v.decisions || null, leaderboard: v.leaderboard || null };
+    download(`supply-game-${tag}-backup.json`, JSON.stringify(data), 'application/json');
+  };
+  const exportCsv = () => {
+    const rows = [...leaderboard].sort((a, b) => b.cash - a.cash);
+    const csv = 'Rank,Team,Cash (GBP),Rounds completed\n' + rows.map((t, i) => `${i + 1},"${t.name.replace(/"/g, '""')}",${t.cash},${t.rounds}`).join('\n');
+    download(`supply-game-${tag}-leaderboard.csv`, csv, 'text/csv');
+  };
+  const importBackup = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const obj = JSON.parse(reader.result);
+        if (!window.confirm('Replace ALL current data of this version with this backup?')) return;
+        await db.ref().update({
+          game: obj.game || null, teams: obj.teams || null, state: obj.state || null,
+          decisions: obj.decisions || null, leaderboard: obj.leaderboard || null
+        });
+      } catch (err) { alert('That file is not a valid backup.'); }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  const ids = Object.keys(teams);
+  const submitted = id => !!(game && decisions[id] && decisions[id]['r' + game.round]);
+  const nSubmitted = game ? ids.filter(submitted).length : 0;
+  const finished = game && game.round > game.totalRounds;
+
+  return (
+    <div className="min-h-screen p-6">
+      <div className="max-w-4xl mx-auto">
+        <div className="flex justify-between items-center mb-5">
+          <h1 className="text-2xl font-bold">🎓 Instructor panel{DEMO_MODE ? ' — PRACTICE version' : ' — REAL game'}</h1>
+          <button onClick={onExit} className="underline text-slate-500">Exit</button>
+        </div>
+
+        {DEMO_MODE && (
+          <div className="bg-amber-50 border border-amber-300 text-amber-900 rounded-lg p-3 mb-5 text-sm">
+            This is the practice version: standard shipping only, no stock-out penalty. Its data is stored separately from the real game.
+            <b> Use a different demand seed in the real game</b>, otherwise students will already know the future demand.
+          </div>)}
+
+        <Card title="Game control">
+          {game ? (
+            <div>
+              <p className="mb-3">{finished ? <b>Game finished.</b> : <>Current round: <b>{game.round}</b> of {game.totalRounds}. Decisions submitted: <b>{nSubmitted}/{ids.length}</b> teams.</>}</p>
+              <div className="flex flex-wrap gap-3">
+                {!finished && <button disabled={busy} onClick={advance} className="bg-indigo-600 text-white px-4 py-2 rounded font-semibold disabled:bg-slate-300">{busy ? 'Working…' : `Close round ${game.round} & advance ▶`}</button>}
+                <button disabled={busy} onClick={processAll} className="bg-slate-200 px-4 py-2 rounded font-semibold">Re-process all teams</button>
+              </div>
+              <p className="text-xs text-slate-500 mt-3">Teams that have not submitted by the time you advance automatically repeat their previous production, shipping and assignments.</p>
+            </div>
+          ) : <p className="text-slate-600 mb-2">No game exists yet.</p>}
+          <div className="mt-5 pt-4 border-t">
+            <div className="font-semibold mb-2">{game ? 'Start a new game (erases everything in this version)' : 'Create the game'}</div>
+            <div className="flex flex-wrap gap-3 items-end">
+              <label className="text-sm">Total rounds<br /><input type="number" value={totalRounds} onChange={e => setTotalRounds(e.target.value)} className="border rounded px-2 py-1 w-24" /></label>
+              <label className="text-sm">Demand seed<br /><input type="number" value={seed} onChange={e => setSeed(e.target.value)} className="border rounded px-2 py-1 w-28" /></label>
+              <button disabled={busy} onClick={startNew} className="bg-emerald-600 text-white px-4 py-2 rounded font-semibold">{game ? 'Reset & start new game' : 'Create game'}</button>
+            </div>
+          </div>
+        </Card>
+
+        <Card title={`Teams (${ids.length})`}>
+          {!ids.length && <p className="text-slate-500 text-sm">No teams yet.</p>}
+          <table className="w-full text-sm">
+            <tbody>
+              {ids.map(id => (
+                <tr key={id} className="border-t">
+                  <td className="py-2">{teams[id].name}</td>
+                  <td className="py-2 text-center">{game && !finished ? (submitted(id) ? <span className="text-green-700">submitted ✓</span> : <span className="text-amber-600">waiting</span>) : ''}</td>
+                  <td className="py-2 text-right"><button onClick={() => removeTeam(id)} className="text-red-600 text-xs underline">remove</button></td>
+                </tr>))}
+            </tbody>
+          </table>
+        </Card>
+
+        <Card title="🏆 Leaderboard"><Leaderboard rows={leaderboard} /></Card>
+
+        <Card title={USE_FIREBASE ? 'Data (stored online in Firebase)' : 'Data (stored only in this browser)'}>
+          <div className="flex flex-wrap gap-3">
+            <button onClick={exportCsv} className="bg-slate-200 px-3 py-2 rounded text-sm font-semibold">Download leaderboard (CSV)</button>
+            <button onClick={exportBackup} className="bg-slate-200 px-3 py-2 rounded text-sm font-semibold">Download full backup (JSON)</button>
+            <label className="bg-slate-200 px-3 py-2 rounded text-sm font-semibold cursor-pointer">Restore backup…<input type="file" accept=".json" onChange={importBackup} className="hidden" /></label>
+          </div>
+          <p className="text-xs text-slate-500 mt-2">{USE_FIREBASE
+            ? 'Data lives in your Firebase database. Download a backup at the end of the course before deleting the project.'
+            : "Clearing your browser's site data deletes the game. Download a backup now and then."}</p>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+/* ================================ APP ================================ */
+function App() {
+  const [game, setGame] = useState(undefined);
+  const [leaderboard, setLeaderboard] = useState([]);
+  const [instructor, setInstructor] = useState(false);
+  // sessionStorage = one login per browser tab, so several teams can play in different tabs
+  const [session, setSession] = useState(() => { try { return JSON.parse(sessionStorage.getItem('sc_session_' + (DEMO_MODE ? 'demo' : 'real'))); } catch (e) { return null; } });
+
+  useEffect(() => {
+    const g = db.ref('game'), l = db.ref('leaderboard');
+    const gc = s => setGame(s.val()),
+          lc = s => { const v = s.val() || {}; setLeaderboard(Object.keys(v).map(k => ({ id: k, ...v[k] }))); };
+    g.on('value', gc); l.on('value', lc);
+    return () => { g.off('value', gc); l.off('value', lc); };
+  }, []);
+
+  const skey = 'sc_session_' + (DEMO_MODE ? 'demo' : 'real');
+  const login = s => { setSession(s); try { sessionStorage.setItem(skey, JSON.stringify(s)); } catch (e) {} };
+  const logout = () => { setSession(null); try { sessionStorage.removeItem(skey); } catch (e) {} };
+  const askInstructor = () => { const p = window.prompt('Instructor password:'); if (p === INSTRUCTOR_PASSWORD) setInstructor(true); else if (p !== null) alert('Wrong password'); };
+
+  const badge = <div className="fixed top-2 right-2 text-xs px-2 py-1 rounded-full bg-slate-200 text-slate-600">{DEMO_MODE ? '🧪 PRACTICE · ' : ''}{USE_FIREBASE ? '🌐 Online (shared)' : '💾 Local mode (this browser only)'}</div>;
+
+  if (instructor) return <>{badge}<Instructor game={game} leaderboard={leaderboard} onExit={() => setInstructor(false)} /></>;
+  if (session && game) return <>{badge}<TeamView team={session} game={game} leaderboard={leaderboard} onLogout={logout} /></>;
+  return <>{badge}<Login game={game} leaderboard={leaderboard} onLogin={login} onInstructor={askInstructor} /></>;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
